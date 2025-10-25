@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Oct 25 21:20:23 2025
+
+@author: marek
+"""
+import sys
+import requests
+import json
+import traceback
+import re
+import os
+import shutil
+from typing import Dict, Any, Optional
+
+CODING_AGENT_CONFIG = {
+    "OLLAMA_API_URL": "http://192.168.1.127:11434/api/chat",
+    "OUTPUT_DIR": "generated_code",
+    "MODELS": {
+        "coder": {"name": "qwen3-coder:latest", "options": {"temperature": 0.6, "num_ctx": 16000, "top_p": 0.95}},
+        "tester": {"name": "qwen3-coder:latest", "options": {"temperature": 0.1, "num_ctx": 16000, "top_p": 0.8}},
+        "debugger": {"name": "qwen3-coder:latest", "options": {"temperature": 0.1, "num_ctx": 16000, "top_p": 0.95}},
+        "analyzer": {"name": "qwen3-coder:latest", "options": {"temperature": 0.0, "num_ctx": 16000}},
+        # --- NEW: Model for generating the test plan from the prompt ---
+        "planner": {"name": "qwen3-coder:latest", "options": {"temperature": 0.2, "num_ctx": 16000, "top_p": 0.8}}
+    }
+}
+MAX_DEBUG_ATTEMPTS = 3
+MAX_TEST_REGEN_ATTEMPTS = 2
+
+class CodingAgentV2:
+    """
+    A self-correcting coding agent that generates, tests, and debugs code.
+    """
+
+    def __init__(self):
+        os.makedirs(CODING_AGENT_CONFIG["OUTPUT_DIR"], exist_ok=True)
+
+    def _call_ollama_api(self, messages: list, model_key: str) -> str:
+        """Internal helper to send requests to the Ollama API."""
+        try:
+            model_config = CODING_AGENT_CONFIG["MODELS"].get(model_key)
+            if not model_config:
+                raise ValueError(f"Model key '{model_key}' not found in config.")
+
+            payload = {
+                "model": model_config["name"],
+                "messages": messages,
+                "options": model_config["options"],
+                "stream": False
+            }
+            response = requests.post(CODING_AGENT_CONFIG["OLLAMA_API_URL"], json=payload, timeout=None)
+            response.raise_for_status()
+            return response.json().get("message", {}).get("content", "").strip()
+        except requests.exceptions.RequestException as e:
+            print(f"Coding Agent API Error: {e}")
+            return f"Error: Failed to connect to '{model_config['name']}' API. Details: {e}"
+
+    # --- NEW: Method to auto-generate a test plan ---
+    def _generate_test_plan(self, language: str, code_prompt: str) -> str:
+        """Uses an LLM to generate a test plan based on the code prompt."""
+        print("  -> [CodingAgentV2] Generating test plan from prompt...")
+        prompt = f"""
+        You are an expert Quality Assurance (QA) engineer. Your task is to create a detailed, step-by-step test plan for a piece of code that will be written in {language}.
+        Analyze the following user request and break it down into a numbered list of specific test cases.
+
+        == User Code Request ==
+        {code_prompt}
+
+        == Instructions ==
+        1. Identify the core functionalities described in the request.
+        2. For each functionality, define at least one "happy path" test case (i.e., it works with normal, expected inputs).
+        3. Identify and create test cases for edge conditions (e.g., empty inputs, zero, large numbers, empty strings).
+        4. Identify and create test cases for error conditions (e.g., invalid input types, division by zero).
+        5. Format your output as a clean, numbered list. Do not include any explanations, conversational text, or markdown.
+        
+        Example Output:
+        1. Test the add function with two positive integers.
+        2. Test the add function with a positive and a negative integer.
+        3. Test the divide function with a non-zero denominator.
+        4. Test that the divide function raises a ValueError when the denominator is zero.
+        """
+        messages = [{'role': 'user', 'content': prompt}]
+        generated_plan = self._call_ollama_api(messages, "planner")
+        return generated_plan
+
+    def _generate_code(self, language: str, prompt: str, initial_code: Optional[str] = None, mode: str = 'generate') -> str:
+        """Generates a code snippet based on a natural language prompt."""
+        print(f"  -> [CodingAgentV2] Generating {language} code in {mode} mode...")
+        system_prompt = f"""You are an expert {language} programmer. Your task is to write a single, clean, well-commented, and efficient code snippet that fulfills the user's request.
+        Respond with ONLY the code snippet, enclosed in a single markdown code block. Do not include any explanations or conversational text outside the code block."""
+        
+        user_message = prompt
+        if initial_code:
+            if mode == 'refactor':
+                user_message = f"Please improve this existing code based on the following prompt:\n\n== Existing Code ==\n```python\n{initial_code}\n```\n\n== Improvement Prompt ==\n{prompt}"
+            elif mode == 'debug':
+                user_message = f"Please debug and fix this existing code based on the following prompt and a test plan that will be provided:\n\n== Existing Code ==\n```python\n{initial_code}\n```\n\n== Debugging Prompt ==\n{prompt}"
+        
+        messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': user_message}]
+        raw_code = self._call_ollama_api(messages, "coder")
+        cleaned_code = re.sub(r'```python|```', '', raw_code).strip()
+        return cleaned_code
+
+    def _generate_unit_tests(self, file_name: str, code_content: str, test_plan_description: str) -> str:
+        """Generates pytest unit tests based on the provided code content and test plan."""
+        print("  -> [CodingAgentV2] Generating unit tests...")
+        prompt = f"""
+        You are an expert Python unit test developer. Your task is to write pytest unit tests for the provided Python code, strictly following the test plan.
+
+        == Original Python File Name ==
+        {file_name}
+
+        == Generated Python Code ==
+        ```python
+        {code_content}
+        ```
+
+        == Test Plan ==
+        {test_plan_description}
+
+        == Instructions ==
+        1. Write valid `pytest` test functions. Name the test file `test_{file_name.replace('.py', '')}.py`.
+        2. Import the necessary classes/functions from the original file.
+        3. Implement test cases that cover all aspects mentioned in the `Test Plan`.
+        4. For negative test cases (e.g., expected errors), use `pytest.raises`.
+        5. Use assertions (`assert`) to verify expected behavior.
+        6. Return ONLY the Python code for the unit tests. Do NOT include any explanations or markdown fences.
+        """
+        raw_test_code = self._call_ollama_api([{'role': 'user', 'content': prompt}], "tester")
+        cleaned_test_code = re.sub(r'```python|```', '', raw_test_code).strip()
+        return cleaned_test_code
+
+    def _debug_code(self, code_content: str, test_output: str, test_file: str) -> str:
+        """Uses an LLM to debug and fix code based on test output."""
+        print("  -> [CodingAgentV2] Debugging failed code...")
+        prompt = f"""
+        You are a senior software engineer. The following code snippet failed to pass its unit tests.
+        Your task is to analyze the code and the test failure output, identify the bug, and provide a corrected version of the code.
+
+        == Original Code ==
+        ```python
+        {code_content}
+        ```
+
+        == Test Failure Output (from {test_file}) ==
+        ```
+        {test_output}
+        ```
+
+        == Instructions ==
+        1. Carefully examine the code and the test output to find the root cause of the error.
+        2. Provide a corrected version of the ENTIRE code snippet.
+        3. Return ONLY the corrected Python code, enclosed in a single markdown code block.
+        """
+        messages = [{'role': 'user', 'content': prompt}]
+        raw_fixed_code = self._call_ollama_api(messages, "debugger")
+        cleaned_fixed_code = re.sub(r'```python|```', '', raw_fixed_code).strip()
+        return cleaned_fixed_code
+    
+    def _analyze_test_failure(self, code_content: str, test_output: str) -> str:
+        """Analyzes a test failure to determine if the bug is in the code or the test."""
+        print("  -> [CodingAgentV2] Analyzing test failure with analyzer model...")
+        prompt = f"""
+        You are a quality assurance expert. Analyze the provided Python code and the output from a failed test run.
+        Your task is to determine the most likely cause of the failure.
+
+        == Code ==
+        ```python
+        {code_content}
+        ```
+
+        == Test Failure Output ==
+        ```
+        {test_output}
+        ```
+
+        Based on your analysis, state whether the failure is a result of a bug in the code or a flaw in the unit test itself.
+        Respond with ONLY one of the following keywords: 'code_bug', 'test_bug', or 'cannot_determine'.
+        """
+        messages = [{'role': 'user', 'content': prompt}]
+        analysis_result = self._call_ollama_api(messages, "analyzer").strip().lower()
+        if analysis_result not in ['code_bug', 'test_bug']:
+            return 'cannot_determine'
+        return analysis_result
+
+    def execute_coding_agent_v2(self, language: str, code_file: str, prompt: str, test_plan: str, mode: str = 'generate', initial_code: Optional[str] = None) -> str:
+        """Orchestrates the entire code generation, testing, and debugging process."""
+        final_answer = "An error occurred during the coding process."
+        test_passed = False
+        
+        try:
+            if initial_code and mode in ['refactor', 'debug']:
+                generated_code = self._generate_code(language, prompt, initial_code, mode)
+            else:
+                generated_code = self._generate_code(language, prompt)
+            
+            if not test_plan:
+                test_plan = self._generate_test_plan(language, prompt)
+
+            test_file = f"test_{code_file}"
+            test_output = ""
+            analysis_result = 'code_bug' # Default assumption
+            
+            for attempt in range(MAX_DEBUG_ATTEMPTS + MAX_TEST_REGEN_ATTEMPTS):
+                print(f"  -> [CodingAgentV2] Starting test attempt {attempt + 1}...")
+                generated_tests = self._generate_unit_tests(code_file, generated_code, test_plan)
+                
+                stdout, stderr, returncode = subprocess.run(['pytest', '-q', '--tb=no', test_file], capture_output=True, text=True)
+
+                if returncode == 0:
+                    print(f"  -> [CodingAgentV2] Tests passed successfully on attempt {attempt + 1}.")
+                    test_output = stdout
+                    test_passed = True
+                    break
+                else:
+                    print(f"  -> [CodingAgentV2] Tests failed on attempt {attempt + 1}. Analyzing failure...")
+                    test_output = stdout + stderr
+                    
+                    analysis_result = self._analyze_test_failure(generated_code, test_output)
+                    print(f"  -> [CodingAgentV2] Analysis result: '{analysis_result}'")
+                    
+                    if analysis_result == 'code_bug' and attempt < MAX_DEBUG_ATTEMPTS:
+                        print("  -> [CodingAgentV2] Identified as a code bug. Attempting to debug...")
+                        generated_code = self._debug_code(generated_code, test_output, test_file)
+                    elif analysis_result == 'test_bug' and attempt < MAX_TEST_REGEN_ATTEMPTS:
+                        print("  -> [CodingAgentV2] Identified as a test bug. Regenerating tests...")
+                        # Loop will regenerate tests
+                    else:
+                        print("  -> [CodingAgentV2] Cannot determine cause or max attempts reached. Stopping.")
+                        break
+
+            if test_passed:
+                final_answer = (f"I have successfully generated and tested the code. All tests passed.\n"
+                                f"The final code has been saved to `{code_file}`.\n\n"
+                                f"**Code:**\n```python\n{generated_code}\n```\n\n"
+                                f"**Test Results:**\n```\n{test_output}\n```")
+            else:
+                analysis_message = "I was unable to fix a bug in the code within the allowed attempts." if analysis_result == 'code_bug' else "My analysis suggests the failure may be due to a flaw in the generated tests, not the code itself."
+                final_answer = (f"I was unable to produce a working solution that passes all tests.\n"
+                                f"The last code version has been saved to `{code_file}`.\n\n"
+                                f"{analysis_message}\n\n"
+                                f"**Last Code Attempt:**\n```python\n{generated_code}\n```\n\n"
+                                f"**Final Test Output:**\n```\n{test_output}\n```")
+
+        except Exception as e:
+            final_answer = f"An unexpected error occurred during coding agent execution: {e}\n{traceback.format_exc()}"
+        
+        return final_answer
+
+# --- UPDATED: Interactive main function with auto-test plan generation ---
+
+def _get_multiline_input(prompt_message: str) -> str:
+    """Helper function to get multi-line input from the user."""
+    print(f"\n{prompt_message}")
+    print(" (Enter your text. Press Ctrl-D on Linux/macOS or Ctrl-Z+Enter on Windows when done)")
+    lines = sys.stdin.readlines()
+    return "".join(lines).strip()
+
+def main():
+    """The main function to run the agent in an interactive CLI mode."""
+    print("--- Coding Agent V2: Interactive Mode ---")
+    print("Please provide the following details for your coding task.")
+    
+    try:
+        language = input("\n▶ Enter the programming language (e.g., python): ")
+        code_file = input("▶ Enter the target filename (e.g., my_module.py): ")
+        prompt = _get_multiline_input("▶ Enter the main prompt describing the code:")
+
+        coding_agent = CodingAgentV2()
+        
+        test_plan = ""
+        while not test_plan:
+            plan_choice = input("\n▶ Test Plan: [M]anual entry or [A]uto-generate? (M/a): ").lower().strip() or 'm'
+            if plan_choice == 'a':
+                generated_plan = coding_agent._generate_test_plan(language, prompt)
+                print("\n--- Proposed Test Plan ---")
+                print(generated_plan)
+                print("--------------------------")
+                confirm = input("▶ Use this plan? [Y/n] (or 'm' to enter manually): ").lower().strip() or 'y'
+                if confirm == 'y':
+                    test_plan = generated_plan
+                elif confirm == 'n':
+                    print("  (Generation cancelled.)")
+                    continue # Re-ask the M/A choice
+                else: # 'm' or anything else falls back to manual
+                    test_plan = _get_multiline_input("▶ Enter your manual test plan:")
+            else: # Manual entry
+                test_plan = _get_multiline_input("▶ Enter your manual test plan:")
+
+        mode = input("\n▶ Enter mode [generate, refactor, debug] (default: generate): ").lower().strip() or 'generate'
+        if mode not in ['generate', 'refactor', 'debug']:
+            print(f"  (Invalid mode '{mode}', defaulting to 'generate'.)")
+            mode = 'generate'
+        
+        initial_code = None
+        if mode in ['refactor', 'debug']:
+            use_initial_file = input(f"▶ Do you want to provide an initial code file for '{mode}' mode? [y/N]: ").lower().strip()
+            if use_initial_file == 'y':
+                initial_code_file = input("  ▶ Enter the path to the initial code file: ")
+                try:
+                    with open(initial_code_file, 'r') as f:
+                        initial_code = f.read()
+                    print(f"--- Loaded initial code from '{initial_code_file}' ---")
+                except FileNotFoundError:
+                    print(f"FATAL: The initial code file '{initial_code_file}' was not found.")
+                    return
+        
+        print("\n--- Initializing Agent and Starting Task ---")
+        final_result = coding_agent.execute_coding_agent_v2(
+            language=language, code_file=code_file,
+            prompt=prompt, test_plan=test_plan, mode=mode, initial_code=initial_code
+        )
+
+        print("\n" + "="*50)
+        print("          AGENT EXECUTION COMPLETE")
+        print("="*50 + "\n")
+        print(final_result)
+
+    except KeyboardInterrupt:
+        print("\n\n--- Operation cancelled by user. Exiting. ---")
+    except Exception as e:
+        print(f"\n--- An unexpected error occurred: {e} ---")
+
+if __name__ == "__main__":
+    main()
